@@ -1,0 +1,62 @@
+--- a/app/src/main/java/io/github/shaonialife/cardeck/iap2/ReceiverProfile.kt
++++ b/app/src/main/java/io/github/shaonialife/cardeck/iap2/ReceiverProfile.kt
+@@ -116,17 +116,19 @@
+                     WifiGen.LEGACY
+                 }
+ 
+-                (signals.sendIds?.size ?: 0) + (signals.receiveIds?.size ?: 0) >= 10 -> {
+-                    // 清单齐且相当完整仍无 0x5703/0x5702——BMW iD9 形态（两清单均 10+ 项）。
+-                    // 不能仅凭「未声明」判新：奥迪清单只列 CarPlay 生命周期消息（实测
+-                    // 发送清单 2 项/可收 5 项，均无 0x57xx），但旧协议工作正常——
+-                    // 稀疏清单不算数，保守 UNKNOWN 走旧协议（0x5703 有超时兜底）
+-                    reasons += "清单完整（${(signals.sendIds?.size ?: 0) + (signals.receiveIds?.size ?: 0)} 项）仍无 0x5703/0x5702——AP 信息由 0x4301 提供"
++                signals.sendIds?.contains(Iap2MessageIds.CARPLAY_START_SESSION) == true &&
++                    (signals.sendIds?.size ?: 0) + (signals.receiveIds?.size ?: 0) >= 10 -> {
++                    // 只有车机明确声明「会发 0x4301」时才算新协议（AP 信息由 0x4301 自带）。
++                    // 否则即便清单很完整，也必须按 UNKNOWN 走 0x5702——BMW MGU-118/iD8
++                    // 的 26 项清单没有 0x4301，旧逻辑误判 NEW 后跳过 0x5702，整轮必死
++                    // （日志：该车机既不支持 0x5703，0x4301 也未提供）。
++                    // 依据：0x5702 是必备但常被漏声明的消息（§5b 四个独立实现）。
++                    reasons += "清单完整（${(signals.sendIds?.size ?: 0) + (signals.receiveIds?.size ?: 0)} 项）且声明 0x4301，无 0x5703/0x5702——AP 信息由 0x4301 提供"
+                     WifiGen.NEW
+                 }
+ 
+                 (signals.sendIds != null || signals.receiveIds != null) -> {
+-                    reasons += "清单稀疏且未声明 0x5703/0x5702——不构成「新协议」证据，保守按旧协议（超时兜底）"
++                    reasons += "清单未同时满足「声明 0x4301 + 完整清单」——不构成「新协议」证据，保守按旧协议（0x5702 超时兜底）"
+                     WifiGen.UNKNOWN
+                 }
+ 
+--- a/app/src/test/java/io/github/shaonialife/cardeck/iap2/ReceiverProfileTest.kt
++++ b/app/src/test/java/io/github/shaonialife/cardeck/iap2/ReceiverProfileTest.kt
+@@ -75,6 +75,30 @@
+     }
+ 
+     @Test
++    fun fullListsWithoutStartSessionStayUnknown() {
++        // BMW MGU-118 / iD8 实车：26 项清单、无 0x5702/0x5703，也没有 0x4301。
++        // 不能判 NEW——否则跳过 0x5702，而车机又不发 0x4301，整轮必死。
++        val p =
++            ReceiverProfile.classify(
++                ReceiverProfile.Signals(
++                    name = "BMW 07026",
++                    model = "MGU-118",
++                    manufacturer = "BMW Group",
++                    sendIds = setOf(
++                        0x5000, 0x5002, 0x5003, 0x6800, 0x6802, 0x6803,
++                        0x4c00, 0x4c02, 0x4c03, 0x4c05, 0x4c07, 0xae00, 0xae02, 0xea03,
++                    ),
++                    receiveIds = setOf(
++                        0x4e09, 0x4e0a, 0x4e0b, 0x4e0c, 0x5001, 0x6801,
++                        0x4c01, 0x4c04, 0x4e0d, 0xae01, 0xea00, 0xea01,
++                    ),
++                ),
++            )
++        assertEquals(ReceiverProfile.WifiGen.UNKNOWN, p.wifiGen)
++        assertTrue(p.reasons.any { it.contains("保守按旧协议") })
++    }
++
++    @Test
+     fun sparseSendListAloneStaysUnknown() {
+         // 单份稀疏清单（2 项）无 0x5703：不判「新」——奥迪的反例证明稀疏清单
+         // 不列 0x57xx 也可以走旧协议
