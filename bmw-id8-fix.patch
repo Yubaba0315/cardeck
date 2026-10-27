@@ -60,3 +60,165 @@
      fun sparseSendListAloneStaysUnknown() {
          // 单份稀疏清单（2 项）无 0x5703：不判「新」——奥迪的反例证明稀疏清单
          // 不列 0x57xx 也可以走旧协议
+--- a/app/src/main/java/io/github/shaonialife/cardeck/video/VideoSender.kt
++++ b/app/src/main/java/io/github/shaonialife/cardeck/video/VideoSender.kt
+@@ -76,6 +76,10 @@
+     @Volatile
+     private var framesSent = 0L
+ 
++    /** 本会话应使用的 H.264 level_idc（按分辨率/帧率算；2662x812@30 → 42）。 */
++    @Volatile
++    private var targetLevelIdc = 40
++
+     /** 推流是否活跃（静默降噪守卫判断用：start 失败时保持 false）。 */
+     val isRunning: Boolean get() = running.get()
+ 
+@@ -125,7 +129,15 @@
+                     ((width * height * 6L).toInt()).coerceIn(2_000_000, 10_000_000) *
+                         if (targetFps >= 60) 1.5f else 1f
+                 ).toInt().coerceAtMost(15_000_000)
+-            log("VIDEO: 启动编码器 ${width}x$height@$targetFps ${bitrate / 1_000_000}Mbps（端口已连通）")
++            // H.264 level 必须按分辨率/帧率算：2662x812@30 = 8517 MBs / 255510 MB/s，
++            // 同时超出 Level 4.0 的 8192 MBs 与 245760 MB/s；固定 40 会让 BMW 解码器
++            // 丢帧/黑屏。Level 4.2 才装得下（8704 MBs / 522240 MB/s）。
++            val levelIdc = requiredLevelIdc(width, height, targetFps)
++            targetLevelIdc = levelIdc
++            log(
++                "VIDEO: 启动编码器 ${width}x$height@$targetFps ${bitrate / 1_000_000}Mbps " +
++                    "level_idc=$levelIdc（端口已连通）",
++            )
+ 
+             val format =
+                 MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+@@ -133,17 +145,14 @@
+                     setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                     setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
+                     setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+-                    // 固定 H.264 level 4.0（SPS level_idc=40，真 iPhone 同款流形态）。
+                     // 不固定时编码器按「分辨率+帧率」自动选：默认 30fps 下 1412x654
+                     // 合法落入 level 3.2——奥迪 DELPHI 解码器对该 level 静默不渲染
+                     // （TCP 照收、会话活着、车机黑屏，2026-10-22 奥迪 0628 真机日志
+-                    // 定谳：同机 level=40 全部成功、level=32 首例黑屏）。60fps 时编码
+-                    // 器本来就选 4.0，此设置对它无变化。
++                    // 定谳：同机 level=40 全部成功、level=32 首例黑屏）。
++                    // 这里按实际分辨率算出的 level 指定；SPS 侧还会再补一次
++                    // （部分编码器静默忽略 KEY_LEVEL）。
+                     runCatching {
+-                        setInteger(
+-                            MediaFormat.KEY_LEVEL,
+-                            MediaCodecInfo.CodecProfileLevel.AVCLevel4,
+-                        )
++                        setInteger(MediaFormat.KEY_LEVEL, levelIdc)
+                     }
+                 }
+             val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+@@ -151,7 +160,7 @@
+             try {
+                 codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+             } catch (levelRejected: Exception) {
+-                log("VIDEO: 指定 level 4.0 被编码器拒绝（${levelRejected.message}）——回退自动选择（部分车机可能黑屏）")
++                log("VIDEO: 指定 level $levelIdc 被编码器拒绝（${levelRejected.message}）——回退自动选择（部分车机可能黑屏）")
+                 val fallback =
+                     MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                         setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+@@ -308,8 +317,8 @@
+             log("VIDEO: csd 缺少 SPS/PPS（${nalUnits.size} 个 NAL），跳过 config")
+             return
+         }
+-        // level_idc 补丁到 4.0（关键帧内嵌 SPS 同样会打补丁，见 sendVideoFrame）
+-        val sps = patchSpsLevel(rawSps)
++        // level_idc 补到本会话算出的目标值（关键帧内嵌 SPS 同样会打补丁，见 sendVideoFrame）
++        val sps = patchSpsLevel(rawSps, targetLevelIdc)
+         val avcc = ByteArrayOutputStream(8 + sps.size + pps.size)
+         avcc.write(1)
+         avcc.write(sps[1].toInt()) // profile
+@@ -365,7 +374,7 @@
+         val packed = ByteArrayOutputStream(size)
+         for (nal in nalUnits) {
+             val out =
+-                if (nal.isNotEmpty() && (nal[0].toInt() and 0x1F) == 7) patchSpsLevel(nal) else nal
++                if (nal.isNotEmpty() && (nal[0].toInt() and 0x1F) == 7) patchSpsLevel(nal, targetLevelIdc) else nal
+             packed.write((out.size ushr 24) and 0xFF)
+             packed.write((out.size ushr 16) and 0xFF)
+             packed.write((out.size ushr 8) and 0xFF)
+@@ -578,28 +587,44 @@
+     }
+ }
+ 
+-/** H.264 level_idc 目标值：4.0（0x28）。真 iPhone 同款流形态。 */
+-private const val TARGET_LEVEL_IDC = 40
++/**
++ * 按分辨率/帧率选 H.264 level_idc。
++ *
++ * - 1412x654@30：3649 MBs / 109470 MB/s → 4.0（40）
++ * - 2662x812@30：8517 MBs / 255510 MB/s → 4.2（42）
++ *   （同时超过 Level 4.0 的 8192 MBs 与 245760 MB/s）
++ * - 再大/再高帧率 → 5.0（50）
++ */
++internal fun requiredLevelIdc(width: Int, height: Int, fps: Int): Int {
++    val mb = ((width + 15) / 16) * ((height + 15) / 16)
++    val mbps = mb * fps
++    return when {
++        mb <= 8192 && mbps <= 245760 -> 40
++        mb <= 8704 && mbps <= 522240 -> 42
++        else -> 50
++    }
++}
+ 
+ /**
+- * 把 SPS 的 level_idc 补丁到 4.0（3.1→4.0 是放宽约束，安全）。
++ * 把 SPS 的 level_idc 补到 [targetLevelIdc]（只升不降）。
+  *
+  * 为什么不改用 MediaFormat.KEY_LEVEL：实测（MagicOS/Android 17）编码器**静默忽略**
+- * 该键——不抛异常、SPS 里仍是 3.1。只能后处理。
++ * 该键——不抛异常、SPS 里仍是自动选的低 level。只能后处理。
+  *
+  * 为什么安全：① level_idc 在 SPS 的固定偏移（nal[3]），单字节改值不改长度；
+- * ② 3.1→4.0 只放宽 maxMBPS/maxFS/maxBR 上限，解码器按 4.0 分配的资源对 3.1 编码
+- * 的流只多不少；③ 0x28 非零且不会引入 emulation prevention 序列（00 00 0x）。
+- * 若 SPS 本来就 ≥4.0（如 60fps 时自动选 4.2），保持原值不降级。
++ * ② 只向上放宽 maxMBPS/maxFS/maxBR 上限，解码器按更高 level 分配的资源对低 level
++ * 编码的流只多不少；③ 非零且不会引入 emulation prevention 序列（00 00 0x）。
++ * 若 SPS 本来就 ≥目标值，保持原值不降级。
+  *
+  * 动机：奥迪 DELPHI 解码器对 level 3.1/3.2 的流静默不渲染（TCP 照收、会话正常、
+  * 车机黑屏；2026-10-22 奥迪 0628 真机日志：同机 level=40 全部成功、level=32 首例黑屏）。
++ * 2026-10-27 BMW MGU-118 2662x812@30 仍黑屏/卡顿：固定 40 对该分辨率非法，需 42。
+  */
+-internal fun patchSpsLevel(sps: ByteArray): ByteArray {
++internal fun patchSpsLevel(sps: ByteArray, targetLevelIdc: Int = 40): ByteArray {
+     if (sps.size < 4) return sps
+     val current = sps[3].toInt() and 0xFF
+-    if (current >= TARGET_LEVEL_IDC) return sps
++    if (current >= targetLevelIdc) return sps
+     val patched = sps.copyOf()
+-    patched[3] = TARGET_LEVEL_IDC.toByte()
++    patched[3] = targetLevelIdc.toByte()
+     return patched
+ }
+--- a/app/src/test/java/io/github/shaonialife/cardeck/video/SpsLevelPatchTest.kt
++++ b/app/src/test/java/io/github/shaonialife/cardeck/video/SpsLevelPatchTest.kt
+@@ -37,6 +37,23 @@
+     }
+ 
+     @Test
++    fun level42ForBmw2662x812At30() {
++        // 8517 MBs / 255510 MB/s：Level 4.0 的 8192/245760 都不够，必须 4.2
++        assertEquals(42, requiredLevelIdc(2662, 812, 30))
++    }
++
++    @Test
++    fun level40ForAudi1412x654At30() {
++        assertEquals(40, requiredLevelIdc(1412, 654, 30))
++    }
++
++    @Test
++    fun patchToTarget42() {
++        val patched = patchSpsLevel(spsOf(40), 42)
++        assertEquals(42, patched[3].toInt() and 0xFF)
++    }
++
++    @Test
+     fun malformedSpsIsPassedThrough() {
+         // 过短的 SPS（缺 level 字节）原样返回，不抛
+         assertTrue(patchSpsLevel(byteArrayOf(0x67)).size == 1)
